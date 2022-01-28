@@ -1,27 +1,15 @@
-import numpy as np
-from scipy import *
-import tensorflow as tf
 from tensorflow import keras
-from tensorflow.python.ops.numpy_ops import np_config
-from sklearn.utils import shuffle
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
 import pickle
+from keras.layers import Dense, Flatten, BatchNormalization
+from tensorflow.python.ops.numpy_ops import np_config
+
 from layers import *
 
 
 np_config.enable_numpy_behavior()
-
-
-class SpreadLoss(keras.Loss):
-
-    def __init__(self, margin=0.2):
-        super().__init__(self)
-        self.margin = margin
-
-    def call(self, y_true, y_pred):
-        return tf.math.maximum(0, self.margin - (y_true - y_pred))**2
-
-    def adjust_margin(self, margin):
-        self.margin = margin
 
 
 class CapsNet(keras.Model):
@@ -33,58 +21,68 @@ class CapsNet(keras.Model):
         self.graphconv3 = GraphConvolutionLayer(8)
         self.graphconv4 = GraphConvolutionLayer(8)
         self.stack = StackLayer()
-        self.caps1 = CapsuleLayer(10, 4, transPOSE=True, shape_ignorant=True)
-        self.caps2 = CapsuleLayer(8, 6)
+        self.caps1 = CapsuleLayer(20, 4, shape_ignorant=True)
+        self.caps2 = CapsuleLayer(12, 6)
         self.caps3 = CapsuleLayer(6, 8)
-        self.optimizer = tf.optimizers.Adam(learning_rate=0.01)
-        self.margin = 0.3
 
 
-    def call(self, X):
+    def call(self, inputs):
+        attributes = inputs[0]
+        adjacency = inputs[1]
         d = tf.reduce_sum(adjacency, axis=-1)
+        dm12 = tf.repeat(tf.reduce_sum(adjacency, axis=-1, keepdims=True), adjacency.shape[-1], axis=-1)
+        X1 = self.graphconv1([attributes, adjacency], dm12)
+        X2 = self.graphconv2([X1, adjacency], dm12)
+        X3 = self.graphconv3([X2, adjacency], dm12)
+        X4 = self.graphconv4([X3, adjacency], dm12)
         act1 = d / tf.reduce_sum(d, axis=-1, keepdims=True)
-        dm12 = tf.repeat(tf.reduce_sum(adjacency, axis=-1, keepdims=True), adjacency.shape[-1], axis=-1) ** tf.constant(
-            -1 / 2)
-        X1 = self.layers[0].call(X, adjacency, dm12)
-        X2 = self.layers[1].call(X1, adjacency, dm12)
-        # X3 = self.layers[2].call(X2, adjacency, dm12)
-        # X4 = self.layers[3].call(X3, adjacency, dm12)
-        caps1 = self.layers[2].call([X1, X2])
-        act2, caps2 = self.layers[3].call(act1, caps1)
-        act3, caps3 = self.layers[4].call(act2, caps2)
-        # act4, caps4 = self.layers[7].call(act3, caps3)
-        # print('shapes: ', act4.shape, caps4.shape)
-        # print('xd')
-
-        return act3
-
-
-    def predict(self, X, adjacency):
-        probas = self.predict_proba(X, adjacency)
-        outputs = tf.one_hot(tf.argmax(probas, axis=-1), 2)
-        return outputs
+        caps1 = self.stack([X1, X2, X3, X4])
+        act2, caps2 = self.caps1([act1, caps1])
+        act3, caps3 = self.caps2([act2, caps2])
+        act4, caps4 = self.caps3([act3, caps3])
+        #pred = K.print_tensor(act4, message='y_pred = ')
+        return act4
 
 
 
 
+with open('labels.pickle', 'rb') as f:
+    labels = pickle.load(f)
+
+with open('attributes.pickle', 'rb') as f:
+    attributes = tf.stack(pickle.load(f), axis=0)
+
+with open('adjacency.pickle', 'rb') as f:
+    adjacency = tf.stack(pickle.load(f), axis=0)
 
 
+scaler = MinMaxScaler()
+attributes = attributes.reshape(-1, 18)
+attributes = scaler.fit_transform(attributes)
+attributes = attributes.reshape(-1, 126, 18)
 
-model = Model()
-model.create_layers()
 
-# with open('labels.pickle', 'rb') as f:
-#     labels = pickle.load(f)
-#
-# with open('attributes.pickle', 'rb') as f:
-#     attributes = pickle.load(f)
-#
-# with open('adjacency.pickle', 'rb') as f:
-#     adjacency = pickle.load(f)
+X_train, X_test, adj_train, adj_test, Y_train, Y_test = train_test_split(attributes, adjacency, labels, train_size=0.8, random_state=1)
 
-from colouring import get_graph_coloring_data
-(train_X, train_adj, train_Y), test = get_graph_coloring_data()
+X_data = {"attributes": X_train,
+        "adjacency": adj_train}
 
-model.fit(train_X, train_adj, train_Y, epochs=100, valid_data=test)
-#print(model.predict(attributes, adjacency))
+Y_data = {"labels": Y_train}
+
+
+if __name__ == '__main__':
+    model = CapsNet()
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=4*1e-4),
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy',
+                           'mse',
+                           'categorical_crossentropy'])
+
+
+    earlyStopping = EarlyStopping(monitor='val_categorical_crossentropy', patience=200, verbose=0, mode='min')
+    mcp_save = ModelCheckpoint('.saved_model', save_format="tf", save_best_only=True, monitor='val_accuracy', mode='max')
+    callbacks = [earlyStopping, mcp_save, mcp_save2]
+    model.fit([X_train, adj_train], Y_train, batch_size=32, epochs=2000, validation_split=0.2, callbacks=callbacks)
+    model.summary()
 
